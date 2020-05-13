@@ -1,0 +1,593 @@
+---
+title: "Relating Protest Attendance and Senator Trump Score"
+author: "Mac Bagwell"
+date: "`r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(lubridate)
+library(modelr)
+
+# Parameters
+WINDOW <- 90
+LAMBDA <- 0.95
+
+protest_file <- here::here("c01-own/data/protests_population.rds")
+member_averages_file <- here::here("c01-own/data/member_averages.rds")
+votes_file <- here::here("c01-own/data/votes.rds")
+class_file <- here::here("c01-own/data/senate-class.rds")
+#===============================================================================
+
+# Code
+ewma <- function(x, lambda, init = median(x, na.rm = TRUE)) {
+	p <- init
+  if_else(!is.finite(x), 0, x) %>% 
+	  map_dbl(~ (p <<- p * lambda + (.) * (1 - lambda)))
+}
+
+protest_trump_plot <- function(state_) {
+  state_plot <- 
+    cowplot::plot_grid(
+      state_protests_ts %>% 
+        filter(state == state_) %>% 
+        ggplot(aes(date, protest_attendance)) +
+        geom_line() +
+        scale_x_date(date_breaks = "3 months") +
+        scale_y_log10() +
+        labs(
+          title = 
+            str_c(
+              state_, 
+              str_glue("EWMA Protest Attendance"), 
+              sep = " "
+            ),
+          x = "Date",
+          y = "Protest Attendance per 100,000 People"
+        ),
+      trump_score_ts %>% 
+        filter(state == state_) %>% 
+        ggplot(aes(date, trump_score_forward, color = last_name)) +
+        geom_line() +
+        scale_x_date(date_breaks = "3 months") +
+        scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
+        theme(legend.position = "bottom") +
+        labs(
+          title = str_c(state_, str_glue("Senator Trump Score, Next {WINDOW} Days"), sep = " "),
+          x = "Date",
+          y = "Trump Score",
+          color = "Senator"
+        ),
+      nrow = 2
+    )
+  
+  state_plot +
+    ggsave(
+      str_glue("c01-own/eda/figures/{state_}_ts.png") %>% 
+        here::here()
+    )
+  
+  state_plot
+}
+
+protest_trump_scatter <- function(state_) {
+  state_protests_ts %>% 
+    filter(state == state_) %>% 
+    left_join(trump_score_ts %>% filter(state == state_), by = c("date", "state")) %>% 
+    drop_na(last_name, protest_attendance, contains("trump_score")) %>% 
+    mutate(trump_pm = trump_score_diff) %>% 
+    ggplot(aes(protest_attendance, trump_pm, fill = date)) +
+    geom_hline(yintercept = 0, size = 1.5, color = "white") +
+    geom_smooth(method = "lm", color = "red", se = FALSE) +
+    geom_jitter(shape = 21, color = "white", stroke = 0.1) +
+    scale_x_log10() +
+    facet_wrap(vars(last_name)) +
+    theme(legend.position = "bottom") +
+    labs(
+      title = 
+        str_c(
+          state_, 
+          str_glue("Senator Change in {WINDOW}-day Plus-Minus vs. Protest Attendance"), 
+          sep = " "
+        ),
+      caption = "Source: FiveThirtyEight, Crowd Counting Consortium",
+      x = "EWMA Protest Attendance",
+      y = "Trump PM"
+    ) +
+    ggsave(
+      str_glue("c01-own/eda/figures/{state_}_scatter.png") %>% 
+        here::here()
+    ) 
+}
+
+protest_population <- read_rds(protest_file) %>% filter(pro_anti_trump == "anti")
+member_averages <- 
+  read_rds(member_averages_file) %>% 
+  filter(congress == 115L) %>% 
+  left_join(read_rds(class_file), by = c("last_name", "state"))
+votes <- read_rds(votes_file) 
+
+state_protests_ts <- 
+  tibble(
+    date = 
+      seq(ymd("2017-02-02"), ymd("2018-12-31"), by = "1 day") %>% as.Date()
+  ) %>% 
+  left_join(
+    protest_population %>% 
+      count(state, date = as.Date(date), wt =  attendance / (population / 1e5)) %>% 
+      pivot_wider(
+        names_from = state,
+        values_from = n,
+        values_fill = list(n = 0L)
+      ),
+    by = "date"
+  ) %>% 
+  mutate_at(
+    vars(-date),
+    ewma,
+    lambda = LAMBDA
+  ) %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "state",
+    values_to = "protest_attendance"
+  )
+
+trump_score_ts <- 
+  tibble(
+    date = 
+      seq(ymd("2017-02-02"), ymd("2018-12-31"), by = "1 day") %>% as.Date()
+  ) %>% 
+  left_join(
+    votes %>% 
+      semi_join(
+        member_averages %>% 
+          filter(congress == 115L, votes >= 80, party != "Independent"),
+        by = "bioguide"
+      ) %>% 
+      mutate(date = as.Date(voted_at)) %>% 
+      group_by(date, bioguide, last_name, state, party) %>% 
+      summarize(
+        agrees = sum(agree),
+        predicted = sum(predicted_probability),
+        votes = n()
+      ) %>% 
+      pivot_wider(
+        names_from = c(bioguide, last_name, state, party),
+        values_from = c(agrees, predicted, votes)
+      ),
+    by = "date"
+  ) %>% 
+  replace_na(list(agrees = 0L, predicted = 0L, votes = 0L)) %>% 
+  mutate_at(
+    vars(
+      starts_with("agrees"), 
+      starts_with("predicted"), 
+      starts_with("votes")
+    ),
+    list(
+      forward = 
+        ~ RcppRoll::roll_suml(., n = WINDOW, fill = NA_integer_, na.rm = TRUE),
+      past = 
+        ~ lag(.) %>% 
+          RcppRoll::roll_sumr(., n = WINDOW, fill = NA_integer_, na.rm = TRUE)
+    )
+  ) %>% 
+  select(date, ends_with("forward"), ends_with("past")) %>% 
+  pivot_longer(
+    cols = -date,
+    names_to = c("variable", "bioguide", "last_name", "state", "party", "window"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>% 
+  pivot_wider(
+    names_from = c(variable, window),
+    values_from = value
+  ) %>%
+  mutate(
+    trump_score_forward = (agrees_forward + 1) / (votes_forward + 2),
+    predicted_trump_score_forward = predicted_forward / votes_forward,
+    trump_score_past = (agrees_past + 1) / (votes_past + 1),
+    predicted_trump_score_past = predicted_past / votes_past,
+    trump_score_diff = trump_score_forward - trump_score_past,
+    predicted_trump_score_diff = 
+      predicted_trump_score_forward - predicted_trump_score_past,
+    last_name = 
+      str_c(
+        last_name,
+        case_when(
+          party == "Republican" ~ str_glue("(R-{state})"),
+          party == "Democrat" ~ str_glue("(D-{state})"),
+          party == "Independent" ~ str_glue("(I-{state})"),
+          TRUE ~ "(Other)"
+        ),
+        sep = " "
+      )
+  )
+```
+
+## Recreating Miras' Plot
+
+Below we recreate a slightly different version of Miras' plot. The
+x-axis is the log of total anti-Trump protest attendance during the 115th session of congress
+by senators' state scaled by population, and the y-axis is the "Trump Score" of
+the senator. We see a negative correlation between the two for the Democrats,
+and a weaker such trend for Republicans. But this could easily be attributed
+to the relative political tastes of the constituencies, and protests need not
+have any causal relationship with Senatorial legilative activity.
+
+```{r}
+protest_population %>% 
+  count(
+    state, 
+    name = "protest_activity", 
+    wt = attendance / (population / 1e5)
+  ) %>% 
+  left_join(
+    member_averages %>%
+      select(state, party, agree_pct, votes) %>% 
+      filter(party != "Independent"),
+    by = "state"
+  ) %>% 
+  ggplot(aes(protest_activity, agree_pct, fill = party)) +
+  geom_smooth(aes(color = party), method = "lm", formula = y ~ log(x)) +
+  geom_point(shape = 21, color = "black") +
+  scale_color_manual(
+    breaks = c("Republican", "Democrat"),
+    values = c(Republican = "red3", Democrat = "royalblue"),
+    aesthetics = c("color", "fill")
+  ) +
+  scale_x_log10(
+    breaks = scales::breaks_log(n = 10)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent()
+  ) +
+  coord_fixed(ratio = 1.5) +
+  theme(legend.position = "bottom") +
+  labs(
+    title = "Senator Trump Score vs. State Protest Activity, 115th Congress",
+    subtitle = "Independents omitted",
+    caption = "Sources: FiveThirtyEight, Crowd Counting Consortium",
+    x = "Protest Attendance per 100,000 People, Feb. 2017 - Dec. 2018",
+    y = "Trump Score",
+    color = NULL,
+    fill = NULL
+  ) +
+  ggsave("figures/miras.png")
+```
+
+## Correlation Between Protest Activity and Trump's Performance
+
+As suspected, Trump's performance is somewhat correlated with protest activity
+in that state. We ought to control for this before considering the effect
+of protests on senators.
+
+```{r}
+protest_trump_state <- 
+  protest_population %>% 
+  count(
+    state, 
+    name = "protest_activity", 
+    wt = attendance / (population / 1e5)
+  ) %>% 
+  left_join(
+    member_averages %>%
+      filter(congress == 115L, party != "Independent") %>% 
+      select(state, net_trump_vote, party, agree_pct),
+    by = "state"
+  )
+
+protest_trump_state %>% 
+  ggplot(aes(net_trump_vote, protest_activity)) +
+  geom_vline(xintercept = 0, color = "white", size = 1.5) +
+  geom_smooth(method = "lm") +
+  geom_text(aes(label = state)) +
+  scale_x_continuous(
+    labels = scales::label_percent(scale = 1)
+  ) +
+  scale_y_log10(
+    breaks = scales::breaks_log(n = 9)
+  ) +
+  labs(
+    title = "Protest Attendance per 100,000 people vs. Net Trump Vote",
+    subtitle = "States that favored Trump are less active",
+    caption = "Sources: FiveThirtyEight, Crowd Counting Consortium",
+    x = "Trump's Margin of Victory, 2016",
+    y = "Protest Attendance per 100,000 people, Feb. 2017 - Dec. 2018"
+  ) +
+  ggsave("figures/protest_vs_net_trump_vote.png")
+```
+
+```{r}
+protest_trump_mod <- 
+  protest_trump_state %>% 
+  fit_with(
+    lm, 
+    list(
+      protest = log(protest_activity) ~ net_trump_vote,
+      trump = agree_pct ~ net_trump_vote * party
+    )
+  )
+
+protest_population %>% 
+  count(
+    state, 
+    name = "protest_activity", 
+    wt = attendance / (population / 1e5)
+  ) %>% 
+  left_join(
+    member_averages %>%
+      select(state, party, agree_pct, net_trump_vote, votes) %>% 
+      filter(party != "Independent", votes >= 80),
+    by = "state"
+  ) %>% 
+  spread_residuals(!!! protest_trump_mod) %>% 
+  ggplot(aes(protest, trump, fill = party)) +
+  geom_hline(yintercept = 0, size = 1.5, color = "white") +
+  geom_vline(xintercept = 0, size = 1.5, color = "white") +
+  geom_point(shape = 21, size = 2, color = "black") +
+  scale_fill_manual(
+    breaks = c("Republican", "Democrat"),
+    values = c(Republican = "red3", Democrat = "royalblue")
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent()
+  ) +
+  theme(legend.position = "bottom") +
+  labs(
+    title = "Residual Trump Score vs. Residual Protest Activity during the 115th Congress",
+    subtitle = "Distribution does not suggest residual effects",
+    caption = "Variables controlled for Trump's 2016 margin of victory by state\nSources: FiveThirtyEight, Crowd Counting Consortium",
+    x = "Residual Protest Activity, Feb. 2017 - Dec. 2018",
+    y = "Residual Trump Score",
+    fill = NULL
+  ) +
+  ggsave("figures/miras-resid.png")
+```
+
+
+## Correlation Between Protest Attendance and Trump Score
+
+Preliminary looks at the time series relationship between state's protest attendance
+and senators' Trump Scores don't reveal any patterns, contrary to Miras' findngs. We would
+expect to find that Trump Score goes down as protest activity increases, However,
+looking at some of the time series plots does not suggest compelling relationships
+
+
+```{r eval=FALSE}
+map(state.abb, protest_trump_plot) %>% 
+  walk(print)
+```
+
+```{r eval=FALSE}
+map(state.abb, protest_trump_scatter) %>% 
+  walk(print)
+```
+
+
+```{r}
+corrs <- 
+  state_protests_ts %>% 
+  left_join(
+    trump_score_ts %>% 
+      semi_join(
+        member_averages %>% 
+          filter(congress == 115, votes > 80),
+        by = "bioguide"
+      ), 
+    by = c("date", "state")
+  ) %>% 
+  filter(date >= "2017-02-16", party != "Independent") %>% 
+  group_by(bioguide, last_name, party, state) %>% 
+  summarize(
+    r = 
+      cor(
+        log(protest_attendance), 
+        trump_score_forward - predicted_trump_score_forward, 
+        method = "spearman", 
+        use = "pair"
+      )
+  ) %>% 
+  ungroup() %>% 
+  left_join(
+    member_averages %>% 
+      select(bioguide, class, net_trump_vote), 
+    by = "bioguide"
+  )
+
+corrs %>% 
+  ggplot(aes(r, fill = party)) +
+  geom_vline(xintercept = 0, color = "white", size = 1.5) +
+  geom_dotplot(alpha = 0.8, binwidth = 0.03) +
+  scale_x_continuous(
+    breaks = scales::breaks_width(0.2)
+  ) +
+  scale_fill_manual(
+    breaks = c("Democrat", "Republican"),
+    values = c("royalblue", "red3")
+  ) + 
+  theme(
+    legend.position = "bottom",
+    axis.ticks.length.y = unit(0, "mm"),
+    axis.text.y = element_blank()
+  ) +
+  labs(
+    title = str_glue("Correlation between {WINDOW}D Forward Trump Score and Protest Activity"),
+    subtitle = "Distribution does not suggest negative effects",
+    caption = "Spearman method used to compute correlation\nSources: FiveThirtyEight, Crowd Counting Consortium",
+    x = "Correlation Coefficient",
+    y = NULL,
+    fill = NULL
+  ) +
+  ggsave("figures/trump_score_protest_spearman.png")
+```
+
+```{r}
+corrs %>% 
+  ggplot(aes(r, fill = party)) +
+  geom_vline(xintercept = 0) +
+  geom_dotplot(binwidth = 0.025, alpha = 0.8) +
+  scale_x_continuous(
+    breaks = scales::breaks_width(0.1)
+  ) +
+  scale_fill_manual(
+    breaks = c("Democrat", "Republican"),
+    values = c(Democrat = "royalblue", Republican = "red3")
+  ) + 
+  facet_grid(
+    rows = vars(class), 
+    labeller = labeller(class = function(x) str_c("Class ", x))
+  ) +
+  coord_fixed(ratio = 0.25) +
+  theme(
+    plot.title = element_text(size = 10),
+    plot.subtitle = element_text(size = 8),
+    plot.caption = element_text(size = 6),
+    strip.text = element_text(size = 8),
+    axis.title = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.text.y = element_blank(),
+    axis.ticks.length.y = unit(0, "mm"),
+    legend.position = "none"
+  ) +
+  labs(
+    title = str_glue("Correlation between change in {WINDOW}-Day Trump Score and Protest Activity"),
+    subtitle = "Class 1 up for re-election in 2018, Class 2 in 2020, Class 3 in 2022",
+    caption = "Spearman method used to compute correlation\nSources: FiveThirtyEight, Crowd Counting Consortium, Wikipedia",
+    x = "Correlation Coefficient",
+    y = NULL
+  ) +
+  ggsave("figures/trump_protest_spearman_class_dot.png")
+
+corrs %>% 
+  ggplot(aes(factor(class), r, fill = party)) +
+  geom_hline(yintercept = 0) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(
+    breaks = scales::breaks_width(0.1)
+  ) +
+  scale_fill_manual(
+    breaks = c("Democrat", "Republican"),
+    values = c(Democrat = "royalblue", Republican = "red3")
+  ) +
+  coord_flip() +
+  theme(
+    plot.title = element_text(size = 12),
+    plot.subtitle = element_text(size = 10),
+    plot.caption = element_text(size = 8),
+    strip.text = element_text(size = 8),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = str_glue("Correlation between change in {WINDOW}-Day Trump Score and Protest Activity"),
+    subtitle = "Class 1 up for re-election in 2018, Class 2 in 2020, Class 3 in 2022",
+    caption = "Spearman method used to compute correlation\nSources: FiveThirtyEight, Crowd Counting Consortium, Wikipedia",
+    x = "Class",
+    y = "Correlation Coefficient",
+    fill = NULL
+  ) +
+  ggsave("figures/trump_protest_spearman_class_box.png")
+```
+
+```{r fig.asp=1}
+corrs %>% 
+  left_join(
+    protest_population %>% 
+      count(
+        state, 
+        name = "protest_activity", 
+        wt = attendance / (population / 1e5)
+      ),
+    by = "state"
+  ) %>% 
+  ggplot(aes(net_trump_vote, r)) +
+  geom_hline(yintercept = 0, size = 1.5, color = "white") +
+  geom_vline(xintercept = 0, size = 1.5, color = "white") +
+  geom_point(aes(fill = party), shape = 21, size = 2) +
+  ggrepel::geom_text_repel(
+    aes(label = last_name, color = party),
+    size = 2
+  ) +
+  scale_x_continuous(
+    breaks = scales::breaks_width(20),
+    labels = scales::label_percent(scale = 1, accuracy = 1)
+  ) +
+  scale_color_manual(
+    breaks = c("Democrat", "Republican"),
+    values = c(Democrat = "royalblue", Republican = "red3"),
+    aesthetics = c("color", "fill")
+  ) +
+  coord_fixed(ratio = 40) +
+  facet_grid(
+    rows = vars(class),
+    labeller = labeller(class = function(x) str_c("Class ", x))
+  ) +
+  theme(legend.position = "bottom") +
+  labs(
+    title = str_glue("Correlation coefficient vs. Trump Victory Margin in State"),
+    subtitle = "Class 1 up for re-election in 2018, Class 2 in 2020, Class 3 in 2022",
+    caption = "Spearman method used to compute correlation\nSources: FiveThirtyEight, Crowd Counting Consortium, Wikipedia",
+    x = "Trump Victory Margin",
+    y = "Correlation Coefficient",
+    color = NULL,
+    fill = NULL
+  ) +
+  ggsave("figures/trump_protest_corr_victory_margin_class.png", width = 10, height = 14)
+```
+
+```{r}
+corrs %>% 
+  left_join(
+    protest_population %>% 
+      count(
+        state, 
+        name = "protest_activity", 
+        wt = attendance / (population / 1e5)
+      ),
+    by = "state"
+  ) %>% 
+  ggplot(aes(protest_activity, r)) +
+  geom_hline(yintercept = 0, size = 1.5, color = "white") +
+  geom_point(aes(fill = party), shape = 21, size = 2) +
+  ggrepel::geom_text_repel(
+    aes(label = last_name, color = party),
+    size = 2
+  ) +
+  scale_x_log10(
+    breaks = scales::breaks_log(n = 10)
+  ) +
+  scale_color_manual(
+    breaks = c("Democrat", "Republican"),
+    values = c(Democrat = "royalblue", Republican = "red3"),
+    aesthetics = c("color", "fill")
+  ) +
+  coord_fixed(ratio = 0.5) +
+  facet_grid(
+    rows = vars(class),
+    labeller = labeller(class = function(x) str_c("Class ", x))
+  ) +
+  theme(legend.position = "bottom") +
+  labs(
+    title = str_glue("Correlation coefficient vs. Protest Attendance in State"),
+    subtitle = "Class 1 up for re-election in 2018, Class 2 in 2020, Class 3 in 2022",
+    caption = "Spearman method used to compute correlation\nSources: FiveThirtyEight, Crowd Counting Consortium, Wikipedia",
+    x = "Total Protest Attendance per 100,000",
+    y = "Correlation Coefficient",
+    color = NULL,
+    fill = NULL
+  ) +
+  ggsave("figures/trump_protest_corr_protest_activity_class.png", width = 10, height = 14)
+```
+
+
