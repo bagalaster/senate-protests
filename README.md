@@ -2,7 +2,7 @@ Resistance Is Futile: Anti-Trump Demonstrations and their Effect on
 Legislation
 ================
 Mac Bagwell
-2020-05-12
+2020-03-11
 
   - [Introduction](#introduction)
   - [Data](#data)
